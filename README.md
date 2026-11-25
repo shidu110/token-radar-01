@@ -17,7 +17,7 @@ Every figure is derived from the snapshot itself at run time; nothing is hardcod
 - Adjust per protocol: momentum from 7-day TVL change (clamped), seasoning from how long the protocol has been listed, and a small reach factor for multi-chain protocols.
 - `implied_value_usd = TVL * category multiple * momentum * seasoning * reach`, rounded to whole dollars.
 
-The board carries all 40 watchlist protocols plus every other pre-token protocol that passes the snapshot's observable eligibility rules — 198 rows on this snapshot. Each row ships five farm steps with a cost and a time commitment, generated from a per-category playbook parameterised by the protocol's own chain, TVL tier and category.
+The board carries all 40 watchlist protocols plus every other pre-token protocol that passes the snapshot's observable eligibility rules — 198 rows on this snapshot. Each row ships four to seven farm steps, generated from a per-category playbook and branched by the protocol's own record — multi-chain protocols gain a bridge step, fast growers a crowding step, protocols with heavy 7-day outflows an investigation step first, old protocols a TGE-timing step. Gas costs follow the protocol's primary chain (Ethereum mainnet is priced like Ethereum mainnet, Solana like Solana), position sizes follow its TVL tier, and every step carries a dollar cost and a time commitment. The model is validated inside the run: a leave-one-out backtest over the snapshot's tokenized protocols (both winsorize variants scored, the better one shipped) produces the residual range behind each protocol's Bear / Base / Bull interval, and every detail view lists the tokenized comparables its category multiple was derived from.
 
 ## Run it
 

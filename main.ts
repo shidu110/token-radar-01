@@ -33,17 +33,18 @@ if (!existsSync(inputFile)) {
   process.stderr.write(`token radar: no snapshot at ${inputFile}; pass --input <snapshot.json|directory>\n`);
   process.exit(2);
 }
-const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
+const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? 'out');
 const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
 const calibration = computeSnapshotCalibration(snapshot);
 const { board, radar } = buildRadar(snapshot, calibration);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) throw new Error(`token radar: ${issue}`);
+const boardRows = board.map(({ slug, name, rank, implied_value_usd, farm_steps }) => ({ slug, name, rank, implied_value_usd, farm_steps }));
 
 const dashboardBytes = readdirSync(join(here, 'dashboard')).reduce((total, name) => total + statSync(join(here, 'dashboard', name)).size, 0);
 if (dashboardBytes > 60_000) throw new Error(`Dashboard source exceeds 60 KB: ${dashboardBytes} bytes`);
 mkdirSync(out, { recursive: true });
-writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
+writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: boardRows })}\n`);
 writeFileSync(join(out, 'data.js'), dataScript(radar));
 copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
 const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
@@ -55,4 +56,5 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, {
 }));
 process.stdout.write(`token radar: ${radar.protocols_scanned} scanned; ${radar.pre_token_candidates} record no token; ${board.length} ranked; ${radar.watchlist_size}/${radar.watchlist_size} watchlist; ${radar.early_size} below floor\n`);
 process.stdout.write(`token radar: ${calibration.global_n} positive-cap ratios; global median ${calibration.global_median}; latest listing ${calibration.latest_listed_at}; dashboard ${dashboardBytes} bytes\n`);
+process.stdout.write(`token radar: LOO ${calibration.backtest.n} rows; variant ${calibration.backtest.chosen} shipped; MdAPE A ${calibration.backtest.variants[0]!.mdape} B ${calibration.backtest.variants[1]!.mdape}; residual p25 ${calibration.residual_p25} p75 ${calibration.residual_p75}\n`);
 process.stdout.write(`token radar: wrote board.json, data.js, dashboard/, screenshots/ and dossier.json to ${out}\n`);

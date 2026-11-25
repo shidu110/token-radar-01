@@ -1,9 +1,12 @@
 import type { Snapshot, SnapshotProtocol } from './snapshot.ts';
-import { farmSteps } from './farm-plans.ts';
+import { farmPlan } from './farm-plans.ts';
+import type { StepMeta } from './farm-plans.ts';
 
 /**
- * Snapshot valuation: usable tokenized ratios require finite mcap > 0 and TVL > 0.
- * Category multiple = (n * median of ratios clipped to global p25..p75 + 8 * raw global median) / (n + 8).
+ * Snapshot valuation. Quantiles use nearest rank: sorted[ceil(p * n) - 1].
+ * Variant A clips raw mcap/TVL ratios to global p25..p75; variant B clips ln(ratio) to
+ * global p5..p95 before exponentiating. Both tune toward the median of their clipped set.
+ * Category multiple = (n * category clipped median + 8 * global clipped median) / (n + 8).
  * Momentum = clamp(1 + change_7d / 100, 0.7, 1.5); missing change is zero.
  * Age is days from listed_at to the latest listed_at in the snapshot; missing age is zero.
  * Seasoning = 0.8 + 0.4 * min(age / 720, 1).
@@ -21,6 +24,8 @@ export const MODEL_CONSTANTS = {
   reach_cap: 1.10,
 };
 
+export type WinsorVariant = 'A' | 'B';
+
 export interface CategoryCalibration {
   category: string | null;
   n: number;
@@ -28,14 +33,38 @@ export interface CategoryCalibration {
   multiple: number;
 }
 
+export interface VariantMetrics {
+  variant: WinsorVariant;
+  label: string;
+  mdape: number;
+  within_2x: number;
+  log_r2: number;
+  n: number;
+}
+
+export interface Backtest {
+  n: number;
+  chosen: WinsorVariant;
+  reason: string;
+  mdape_gap_pp: number;
+  variants: VariantMetrics[];
+}
+
 export interface Calibration {
   constants: typeof MODEL_CONSTANTS;
+  variant: WinsorVariant;
+  variant_label: string;
   global_n: number;
   global_median: number;
-  global_p25: number;
-  global_p75: number;
+  clip_low: number;
+  clip_high: number;
+  clip_prob_low: number;
+  clip_prob_high: number;
   latest_listed_at: string | null;
   categories: CategoryCalibration[];
+  backtest: Backtest;
+  residual_p25: number;
+  residual_p75: number;
 }
 
 export interface Breakdown {
@@ -51,6 +80,13 @@ export interface Breakdown {
   unrounded_value_usd: number;
 }
 
+export interface Comparable {
+  name: string;
+  tvl_usd: number;
+  mcap_usd: number;
+  ratio: number;
+}
+
 export interface BoardRow extends SnapshotProtocol {
   rank: number;
   implied_value_usd: number;
@@ -63,6 +99,14 @@ export interface BoardRow extends SnapshotProtocol {
   category_size: number;
   model: Breakdown;
   farm_steps: string[];
+  steps_meta: StepMeta[];
+  totals: { cost_low: number; cost_high: number; total_minutes: number };
+}
+
+export interface EvidenceRow extends BoardRow {
+  bear_usd: number;
+  bull_usd: number;
+  comps: Comparable[];
 }
 
 const EXCLUDED_CATEGORIES = new Set(['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX']);
@@ -84,73 +128,195 @@ export function compareText(first: string, second: string): number {
   return first < second ? -1 : first > second ? 1 : 0;
 }
 
-function quantile(sorted: number[], probability: number): number {
-  const position = (sorted.length - 1) * probability;
-  const lower = Math.floor(position);
-  return sorted[lower]! + (sorted[Math.ceil(position)]! - sorted[lower]!) * (position - lower);
+export function nearestRank(sorted: number[], probability: number): number {
+  if (sorted.length === 0) throw new Error('nearestRank: empty sample');
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(probability * sorted.length) - 1));
+  return sorted[index]!;
 }
 
-export function computeSnapshotCalibration(snapshot: Snapshot): Calibration {
-  const groups = new Map<string | null, number[]>();
-  for (const protocol of snapshot.protocols) groups.set(protocol.category, []);
-  const ratios: number[] = [];
-  for (const protocol of snapshot.protocols) {
-    if (isPreToken(protocol) || protocol.mcap_usd === null || !Number.isFinite(protocol.mcap_usd)
-      || protocol.mcap_usd <= 0 || !Number.isFinite(protocol.tvl_usd) || protocol.tvl_usd <= 0) continue;
-    const ratio = protocol.mcap_usd / protocol.tvl_usd;
-    ratios.push(ratio);
-    groups.get(protocol.category)!.push(ratio);
+function sortedNumbers(values: number[]): number[] {
+  return values.toSorted((first, second) => first - second);
+}
+
+function median(values: number[]): number {
+  const sorted = sortedNumbers(values);
+  return (sorted[Math.floor((sorted.length - 1) / 2)]! + sorted[Math.ceil((sorted.length - 1) / 2)]!) / 2;
+}
+
+function usableRatio(protocol: SnapshotProtocol): boolean {
+  return protocol.mcap_usd !== null && Number.isFinite(protocol.mcap_usd) && protocol.mcap_usd > 0
+    && Number.isFinite(protocol.tvl_usd) && protocol.tvl_usd > 0;
+}
+
+function ageDays(protocol: SnapshotProtocol, latest: string | null): number {
+  return protocol.listed_at && latest ? (Date.parse(latest) - Date.parse(protocol.listed_at)) / 86_400_000 : 0;
+}
+
+function factors(protocol: SnapshotProtocol, latest: string | null) {
+  const change = protocol.change_7d ?? 0;
+  const momentum = Math.min(MODEL_CONSTANTS.momentum_max, Math.max(MODEL_CONSTANTS.momentum_min, 1 + change / 100));
+  const age = ageDays(protocol, latest);
+  const seasoning = MODEL_CONSTANTS.seasoning_base + MODEL_CONSTANTS.seasoning_range * Math.min(age / MODEL_CONSTANTS.seasoning_days, 1);
+  const reach = Math.min(1 + MODEL_CONSTANTS.reach_per_chain * (protocol.chains.length - 1), MODEL_CONSTANTS.reach_cap);
+  return { change, momentum, age, seasoning, reach };
+}
+
+interface FittedCalibration {
+  globalN: number;
+  globalMedian: number;
+  clipLow: number;
+  clipHigh: number;
+  clipProbLow: number;
+  clipProbHigh: number;
+  categories: CategoryCalibration[];
+}
+
+function fitCalibration(snapshot: Snapshot, variant: WinsorVariant, excludedSlug: string | null): FittedCalibration {
+  const usable = snapshot.protocols.filter((protocol) => usableRatio(protocol) && protocol.slug !== excludedSlug);
+  if (usable.length === 0) throw new Error('Snapshot has no usable positive tokenized market-cap/TVL ratios');
+  const allCategories = new Set(snapshot.protocols.map((protocol) => protocol.category));
+  const raw = usable.map((protocol) => protocol.mcap_usd! / protocol.tvl_usd);
+  let clipLow: number;
+  let clipHigh: number;
+  let clipProbLow: number;
+  let clipProbHigh: number;
+  let clipped: number[];
+  if (variant === 'A') {
+    const sorted = sortedNumbers(raw);
+    clipProbLow = 0.25;
+    clipProbHigh = 0.75;
+    clipLow = nearestRank(sorted, clipProbLow);
+    clipHigh = nearestRank(sorted, clipProbHigh);
+    clipped = raw.map((ratio) => Math.max(clipLow, Math.min(clipHigh, ratio)));
+  } else {
+    const logs = sortedNumbers(raw.map((ratio) => Math.log(ratio)));
+    clipProbLow = 0.05;
+    clipProbHigh = 0.95;
+    const logLow = nearestRank(logs, clipProbLow);
+    const logHigh = nearestRank(logs, clipProbHigh);
+    clipLow = Math.exp(logLow);
+    clipHigh = Math.exp(logHigh);
+    clipped = raw.map((ratio) => Math.exp(Math.max(logLow, Math.min(logHigh, Math.log(ratio)))));
   }
-  if (ratios.length === 0) throw new Error('Snapshot has no usable positive tokenized market-cap/TVL ratios');
-  ratios.sort((first, second) => first - second);
-  const globalMedian = quantile(ratios, 0.5);
-  const globalP25 = quantile(ratios, 0.25);
-  const globalP75 = quantile(ratios, 0.75);
+  const globalMedian = median(clipped);
+  const groups = new Map<string | null, number[]>();
+  for (const category of allCategories) groups.set(category, []);
+  for (const [index, protocol] of usable.entries()) groups.get(protocol.category)!.push(clipped[index]!);
   const categories = [...groups.entries()].sort(([first], [second]) => compareText(first ?? '', second ?? '')).map(([category, values]) => {
-    const clipped = values.map((ratio) => Math.min(globalP75, Math.max(globalP25, ratio))).sort((first, second) => first - second);
-    const median = clipped.length ? quantile(clipped, 0.5) : null;
+    const categoryMedian = values.length ? median(values) : null;
     return {
       category,
       n: values.length,
-      median,
-      multiple: (values.length * (median ?? globalMedian) + MODEL_CONSTANTS.shrinkage_weight * globalMedian)
+      median: categoryMedian,
+      multiple: (values.length * (categoryMedian ?? globalMedian) + MODEL_CONSTANTS.shrinkage_weight * globalMedian)
         / (values.length + MODEL_CONSTANTS.shrinkage_weight),
     };
   });
+  return { globalN: usable.length, globalMedian, clipLow, clipHigh, clipProbLow, clipProbHigh, categories };
+}
+
+function predictWith(protocol: SnapshotProtocol, fitted: FittedCalibration, latest: string | null): number {
+  const category = fitted.categories.find((group) => group.category === protocol.category);
+  const multiple = category?.multiple ?? fitted.globalMedian;
+  const factor = factors(protocol, latest);
+  return protocol.tvl_usd * multiple * factor.momentum * factor.seasoning * factor.reach;
+}
+
+interface VariantRun {
+  metrics: VariantMetrics;
+  residuals: number[];
+}
+
+function runBacktest(snapshot: Snapshot, latest: string | null, variant: WinsorVariant): VariantRun {
+  const usable = snapshot.protocols.filter(usableRatio);
+  const residuals: number[] = [];
+  const actuals: number[] = [];
+  const absolutePercentageErrors: number[] = [];
+  for (const protocol of usable) {
+    const fitted = fitCalibration(snapshot, variant, protocol.slug);
+    const predicted = predictWith(protocol, fitted, latest);
+    const actual = protocol.mcap_usd!;
+    residuals.push(Math.log(predicted / actual));
+    absolutePercentageErrors.push(Math.abs(predicted - actual) / actual);
+    actuals.push(Math.log(actual));
+  }
+  const mdape = median(absolutePercentageErrors);
+  const within = residuals.filter((residual) => {
+    const ratio = Math.exp(residual);
+    return ratio >= 0.5 && ratio <= 2;
+  }).length / residuals.length;
+  const meanActual = actuals.reduce((total, value) => total + value, 0) / actuals.length;
+  const ssTotal = actuals.reduce((total, value) => total + (value - meanActual) ** 2, 0);
+  const ssResidual = residuals.reduce((total, value) => total + value ** 2, 0);
+  return {
+    metrics: {
+      variant,
+      label: variant === 'A' ? 'A · raw p25-p75 clip' : 'B · log p5-p95 clip',
+      mdape,
+      within_2x: within,
+      log_r2: 1 - ssResidual / ssTotal,
+      n: usable.length,
+    },
+    residuals,
+  };
+}
+
+export function computeSnapshotCalibration(snapshot: Snapshot): Calibration {
   const listingDates = snapshot.protocols.flatMap((protocol) => protocol.listed_at ? [protocol.listed_at] : []).sort(compareText);
+  const latest = listingDates.at(-1) ?? null;
+  const runA = runBacktest(snapshot, latest, 'A');
+  const runB = runBacktest(snapshot, latest, 'B');
+  const gap = Math.abs(runA.metrics.mdape - runB.metrics.mdape);
+  const chosen: WinsorVariant = gap < 0.005 ? 'A' : runB.metrics.mdape < runA.metrics.mdape ? 'B' : 'A';
+  const reason = gap < 0.005
+    ? `Variant A shipped: the MdAPE gap is ${(gap * 100).toFixed(3)} percentage points, under the 0.5-point churn threshold, so the simpler raw winsorization is retained.`
+    : chosen === 'B'
+      ? `Variant B shipped: its LOO MdAPE is ${(gap * 100).toFixed(3)} percentage points lower than variant A.`
+      : `Variant A shipped: its LOO MdAPE is ${(gap * 100).toFixed(3)} percentage points lower than variant B.`;
+  const chosenRun = chosen === 'A' ? runA : runB;
+  const fitted = fitCalibration(snapshot, chosen, null);
+  const residuals = sortedNumbers(chosenRun.residuals);
   return {
     constants: MODEL_CONSTANTS,
-    global_n: ratios.length,
-    global_median: globalMedian,
-    global_p25: globalP25,
-    global_p75: globalP75,
-    latest_listed_at: listingDates.at(-1) ?? null,
-    categories,
+    variant: chosen,
+    variant_label: chosen === 'A' ? 'Raw p25-p75 winsorization' : 'Log p5-p95 winsorization',
+    global_n: fitted.globalN,
+    global_median: fitted.globalMedian,
+    clip_low: fitted.clipLow,
+    clip_high: fitted.clipHigh,
+    clip_prob_low: fitted.clipProbLow,
+    clip_prob_high: fitted.clipProbHigh,
+    latest_listed_at: latest,
+    categories: fitted.categories,
+    backtest: {
+      n: chosenRun.metrics.n,
+      chosen,
+      reason,
+      mdape_gap_pp: gap * 100,
+      variants: [runA.metrics, runB.metrics],
+    },
+    residual_p25: nearestRank(residuals, 0.25),
+    residual_p75: nearestRank(residuals, 0.75),
   };
 }
 
 export function valueProtocol(protocol: SnapshotProtocol, calibration: Calibration): { implied: number; model: Breakdown } {
   const category = calibration.categories.find((group) => group.category === protocol.category);
   const multiple = category?.multiple ?? calibration.global_median;
-  const change = protocol.change_7d ?? 0;
-  const momentum = Math.min(MODEL_CONSTANTS.momentum_max, Math.max(MODEL_CONSTANTS.momentum_min, 1 + change / 100));
-  const age = protocol.listed_at && calibration.latest_listed_at
-    ? (Date.parse(calibration.latest_listed_at) - Date.parse(protocol.listed_at)) / 86_400_000 : 0;
-  const seasoning = MODEL_CONSTANTS.seasoning_base + MODEL_CONSTANTS.seasoning_range * Math.min(age / MODEL_CONSTANTS.seasoning_days, 1);
-  const reach = Math.min(1 + MODEL_CONSTANTS.reach_per_chain * (protocol.chains.length - 1), MODEL_CONSTANTS.reach_cap);
-  const unrounded = protocol.tvl_usd * multiple * momentum * seasoning * reach;
+  const factor = factors(protocol, calibration.latest_listed_at);
+  const unrounded = protocol.tvl_usd * multiple * factor.momentum * factor.seasoning * factor.reach;
   return {
     implied: Math.max(1, Math.round(unrounded)),
     model: {
       category_n: category?.n ?? 0,
       category_median: category?.median ?? null,
       category_multiple: multiple,
-      change_7d_used: change,
-      momentum,
-      age_days: age,
-      seasoning,
+      change_7d_used: factor.change,
+      momentum: factor.momentum,
+      age_days: factor.age,
+      seasoning: factor.seasoning,
       chain_count: protocol.chains.length,
-      reach,
+      reach: factor.reach,
       unrounded_value_usd: unrounded,
     },
   };
@@ -174,6 +340,7 @@ export function buildBoard(snapshot: Snapshot, calibration: Calibration): BoardR
     const rank = index + 1;
     const categoryRank = (categoryRanks.get(protocol.category) ?? 0) + 1;
     categoryRanks.set(protocol.category, categoryRank);
+    const plan = farmPlan(protocol, entry.model.age_days);
     return {
       ...protocol,
       rank,
@@ -186,7 +353,9 @@ export function buildBoard(snapshot: Snapshot, calibration: Calibration): BoardR
       category_rank: categoryRank,
       category_size: categorySizes.get(protocol.category)!,
       model: entry.model,
-      farm_steps: farmSteps(protocol),
+      farm_steps: plan.farm_steps,
+      steps_meta: plan.steps_meta,
+      totals: plan.totals,
     };
   });
 }
@@ -201,9 +370,10 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (!isPreToken(row)) return `${row.slug} records a token`;
     if (row.rank !== index + 1 || (index > 0 && row.implied_value_usd > board[index - 1]!.implied_value_usd)) return `invalid rank/value order at ${row.slug}`;
     if (!Number.isSafeInteger(row.implied_value_usd) || row.implied_value_usd < 1 || row.implied_value_usd > 100_000_000_000_000) return `invalid value at ${row.slug}`;
-    if (row.farm_steps.length !== 5) return `${row.slug} needs exactly five farm steps`;
+    if (row.farm_steps.length < 4 || row.farm_steps.length > 7) return `${row.slug} needs four to seven farm steps`;
+    if (row.steps_meta.length !== row.farm_steps.length) return `${row.slug} step metadata count differs`;
     for (const step of row.farm_steps) {
-      if (step.trim().length < 120 || step.trim().length > 400 || steps.has(step)) return `invalid or repeated farm step at ${row.slug}`;
+      if (step.trim().length < 20 || step.trim().length > 600 || steps.has(step)) return `invalid or repeated farm step at ${row.slug}`;
       steps.add(step);
     }
   }
@@ -211,13 +381,42 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
   return null;
 }
 
+function comparablesFor(row: BoardRow, snapshot: Snapshot): Comparable[] {
+  return snapshot.protocols
+    .filter((protocol) => protocol.slug !== row.slug && protocol.category === row.category
+      && !isPreToken(protocol) && usableRatio(protocol))
+    .map((protocol) => ({ protocol, distance: Math.abs(Math.log(protocol.tvl_usd / row.tvl_usd)) }))
+    .sort((first, second) => first.distance - second.distance || compareText(first.protocol.slug, second.protocol.slug))
+    .slice(0, 5)
+    .map(({ protocol }) => ({
+      name: protocol.name,
+      tvl_usd: protocol.tvl_usd,
+      mcap_usd: protocol.mcap_usd!,
+      ratio: Number((protocol.mcap_usd! / protocol.tvl_usd).toFixed(3)),
+    }));
+}
+
+function intervals(row: BoardRow, calibration: Calibration): { bear_usd: number; bull_usd: number } {
+  let bear = Math.max(1, Math.round(row.implied_value_usd * Math.exp(calibration.residual_p25)));
+  let bull = Math.round(row.implied_value_usd * Math.exp(calibration.residual_p75));
+  if (bear >= row.implied_value_usd) bear = row.implied_value_usd - 1;
+  if (bull <= row.implied_value_usd) bull = row.implied_value_usd + 1;
+  return { bear_usd: Math.max(1, bear), bull_usd: bull };
+}
+
 export function buildRadar(snapshot: Snapshot, calibration: Calibration) {
   const board = buildBoard(snapshot, calibration);
+  const rows: EvidenceRow[] = board.map((row) => ({
+    ...row,
+    ...intervals(row, calibration),
+    comps: comparablesFor(row, snapshot),
+  }));
   return {
     board,
+    rows,
     radar: {
       product: 'Pre-Token Radar',
-      model_version: 'snapshot-shrinkage-1',
+      model_version: 'snapshot-shrinkage-2',
       as_of: snapshot.as_of,
       source: snapshot.source,
       floor_usd: snapshot.floor_usd,
@@ -230,7 +429,7 @@ export function buildRadar(snapshot: Snapshot, calibration: Calibration) {
       early_size: board.filter((row) => row.below_floor).length,
       total_implied_value_usd: board.reduce((total, row) => total + row.implied_value_usd, 0),
       calibration,
-      rows: board,
+      rows,
     },
   };
 }
