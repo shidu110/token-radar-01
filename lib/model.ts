@@ -370,12 +370,14 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (!isPreToken(row)) return `${row.slug} records a token`;
     if (row.rank !== index + 1 || (index > 0 && row.implied_value_usd > board[index - 1]!.implied_value_usd)) return `invalid rank/value order at ${row.slug}`;
     if (!Number.isSafeInteger(row.implied_value_usd) || row.implied_value_usd < 1 || row.implied_value_usd > 100_000_000_000_000) return `invalid value at ${row.slug}`;
-    if (row.farm_steps.length < 4 || row.farm_steps.length > 7) return `${row.slug} needs four to seven farm steps`;
+    if (row.farm_steps.length < 4 || row.farm_steps.length > 8) return `${row.slug} needs four to eight farm steps`;
     if (row.steps_meta.length !== row.farm_steps.length) return `${row.slug} step metadata count differs`;
     for (const step of row.farm_steps) {
       if (step.trim().length < 20 || step.trim().length > 600 || steps.has(step)) return `invalid or repeated farm step at ${row.slug}`;
+      if (!step.includes(row.name) || !row.chains.some((chain) => step.includes(`on ${chain} (`))) return `farm step lacks protocol/chain context at ${row.slug}`;
       steps.add(step);
     }
+    if (row.steps_meta.at(-1)?.kind !== 'launch') return `missing final eligibility step at ${row.slug}`;
   }
   if (board[0]!.implied_value_usd === board.at(-1)!.implied_value_usd) return 'all board values are equal';
   return null;
