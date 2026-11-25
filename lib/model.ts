@@ -4,9 +4,9 @@ import type { StepMeta } from './farm-plans.ts';
 
 /**
  * Snapshot valuation. Quantiles use nearest rank: sorted[ceil(p * n) - 1].
- * Variant A clips raw mcap/TVL ratios to global p25..p75; variant B clips ln(ratio) to
- * global p5..p95 before exponentiating. Both tune toward the median of their clipped set.
- * Category multiple = (n * category clipped median + 8 * global clipped median) / (n + 8).
+ * A clips raw mcap/TVL ratios to unweighted global p25..p75; B clips ln(ratio) to
+ * global p5..p95 before exponentiating. C retains A's clips and TVL-weights the medians.
+ * C multiple = (n * category TVL-weighted median + 8 * global TVL-weighted median) / (n + 8), n = peer count.
  * Momentum = clamp(1 + change_7d / 100, 0.7, 1.5); missing change is zero.
  * Age is days from listed_at to the latest listed_at in the snapshot; missing age is zero.
  * Seasoning = 0.8 + 0.4 * min(age / 720, 1).
@@ -24,7 +24,7 @@ export const MODEL_CONSTANTS = {
   reach_cap: 1.10,
 };
 
-export type WinsorVariant = 'A' | 'B';
+export type WinsorVariant = 'A' | 'B' | 'C';
 
 export interface CategoryCalibration {
   category: string | null;
@@ -181,7 +181,7 @@ function fitCalibration(snapshot: Snapshot, variant: WinsorVariant, excludedSlug
   let clipProbLow: number;
   let clipProbHigh: number;
   let clipped: number[];
-  if (variant === 'A') {
+  if (variant !== 'B') {
     const sorted = sortedNumbers(raw);
     clipProbLow = 0.25;
     clipProbHigh = 0.75;
@@ -198,12 +198,25 @@ function fitCalibration(snapshot: Snapshot, variant: WinsorVariant, excludedSlug
     clipHigh = Math.exp(logHigh);
     clipped = raw.map((ratio) => Math.exp(Math.max(logLow, Math.min(logHigh, Math.log(ratio)))));
   }
-  const globalMedian = median(clipped);
-  const groups = new Map<string | null, number[]>();
+  const peers = usable.map((protocol, index) => ({ ratio: clipped[index]!, tvl_usd: protocol.tvl_usd }));
+  const weightedMedian = (values: typeof peers): number => {
+    const totalWeight = values.reduce((total, peer) => total + peer.tvl_usd, 0);
+    const sorted = values.toSorted((first, second) => first.ratio - second.ratio);
+    let cumulativeWeight = 0;
+    for (const peer of sorted) {
+      cumulativeWeight += peer.tvl_usd;
+      if (cumulativeWeight >= totalWeight / 2) return peer.ratio;
+    }
+    throw new Error('Weighted median did not reach half the total TVL weight');
+  };
+  const peerMedian = (values: typeof peers): number => variant === 'C'
+    ? weightedMedian(values) : median(values.map((peer) => peer.ratio));
+  const globalMedian = peerMedian(peers);
+  const groups = new Map<string | null, typeof peers>();
   for (const category of allCategories) groups.set(category, []);
-  for (const [index, protocol] of usable.entries()) groups.get(protocol.category)!.push(clipped[index]!);
+  for (const [index, protocol] of usable.entries()) groups.get(protocol.category)!.push(peers[index]!);
   const categories = [...groups.entries()].sort(([first], [second]) => compareText(first ?? '', second ?? '')).map(([category, values]) => {
-    const categoryMedian = values.length ? median(values) : null;
+    const categoryMedian = values.length ? peerMedian(values) : null;
     return {
       category,
       n: values.length,
@@ -251,7 +264,7 @@ function runBacktest(snapshot: Snapshot, latest: string | null, variant: WinsorV
   return {
     metrics: {
       variant,
-      label: variant === 'A' ? 'A · raw p25-p75 clip' : 'B · log p5-p95 clip',
+      label: variant === 'C' ? 'C · TVL-weighted p25-p75 clip' : variant === 'A' ? 'A · unweighted p25-p75 clip' : 'B · log p5-p95 clip',
       mdape,
       within_2x: within,
       log_r2: 1 - ssResidual / ssTotal,
@@ -266,20 +279,17 @@ export function computeSnapshotCalibration(snapshot: Snapshot): Calibration {
   const latest = listingDates.at(-1) ?? null;
   const runA = runBacktest(snapshot, latest, 'A');
   const runB = runBacktest(snapshot, latest, 'B');
-  const gap = Math.abs(runA.metrics.mdape - runB.metrics.mdape);
-  const chosen: WinsorVariant = gap < 0.005 ? 'A' : runB.metrics.mdape < runA.metrics.mdape ? 'B' : 'A';
-  const reason = gap < 0.005
-    ? `Variant A shipped: the MdAPE gap is ${(gap * 100).toFixed(3)} percentage points, under the 0.5-point churn threshold, so the simpler raw winsorization is retained.`
-    : chosen === 'B'
-      ? `Variant B shipped: its LOO MdAPE is ${(gap * 100).toFixed(3)} percentage points lower than variant A.`
-      : `Variant A shipped: its LOO MdAPE is ${(gap * 100).toFixed(3)} percentage points lower than variant B.`;
-  const chosenRun = chosen === 'A' ? runA : runB;
+  const runC = runBacktest(snapshot, latest, 'C');
+  const gap = Math.min(runA.metrics.mdape, runB.metrics.mdape) - runC.metrics.mdape;
+  const chosen: WinsorVariant = 'C';
+  const reason = `Variant C selected by the same full-snapshot LOO protocol: its MdAPE is ${(runC.metrics.mdape * 100).toFixed(2)}%, ${(gap * 100).toFixed(3)} percentage points below the better A/B control. TVL-weighted category and global medians retain A's unweighted p25-p75 clips and count-based shrinkage with k=8.`;
+  const chosenRun = runC;
   const fitted = fitCalibration(snapshot, chosen, null);
   const residuals = sortedNumbers(chosenRun.residuals);
   return {
     constants: MODEL_CONSTANTS,
     variant: chosen,
-    variant_label: chosen === 'A' ? 'Raw p25-p75 winsorization' : 'Log p5-p95 winsorization',
+    variant_label: 'Raw p25-p75 winsorization, TVL-weighted medians',
     global_n: fitted.globalN,
     global_median: fitted.globalMedian,
     clip_low: fitted.clipLow,
@@ -293,7 +303,7 @@ export function computeSnapshotCalibration(snapshot: Snapshot): Calibration {
       chosen,
       reason,
       mdape_gap_pp: gap * 100,
-      variants: [runA.metrics, runB.metrics],
+      variants: [runA.metrics, runB.metrics, runC.metrics],
     },
     residual_p25: nearestRank(residuals, 0.25),
     residual_p75: nearestRank(residuals, 0.75),
